@@ -1,0 +1,2 @@
+Este es un script de automatizacion.
+Rama creada para desarrollar procesos automatizados.
