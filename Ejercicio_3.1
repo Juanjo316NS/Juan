@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""
+Servidor Proxy de Redirección de Puertos (Port Forwarding)
+Compatible con Python 3.14 (Asyncio)
+"""
+
+import argparse
+import asyncio
+import logging
+
+LOCAL_SERVER_HOST = "localhost"
+REMOTE_SERVER_HOST = "www.google.com"
+BUFSIZE = 4096
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+
+async def pipe(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """Retransmite los datos recibidos de un extremo al otro de la conexión."""
+    try:
+        while data := await reader.read(BUFSIZE):
+            writer.write(data)
+            await writer.drain()
+    except (asyncio.CancelledError, ConnectionResetError):
+        pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def handle_client(
+    client_reader: asyncio.StreamReader,
+    client_writer: asyncio.StreamWriter,
+    remote_host: str,
+    remote_port: int,
+) -> None:
+    """Maneja la conexión entrante y establece el puente con el host remoto."""
+    client_addr = client_writer.get_extra_info("peername")
+    logging.info("Conexión entrante desde: %s", client_addr)
+
+    try:
+        remote_reader, remote_writer = await asyncio.open_connection(
+            remote_host, remote_port
+        )
+    except Exception as err:
+        logging.error(
+            "Error al conectar al destino %s:%s - %s",
+            remote_host,
+            remote_port,
+            err,
+        )
+        client_writer.close()
+        await client_writer.wait_closed()
+        return
+
+    # Inicia la transferencia bidireccional en paralelo
+    client_to_remote = asyncio.create_task(pipe(client_reader, remote_writer))
+    remote_to_client = asyncio.create_task(pipe(remote_reader, client_writer))
+
+    await asyncio.gather(
+        client_to_remote, remote_to_client, return_exceptions=True
+    )
+    logging.info("Conexión cerrada para: %s", client_addr)
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Servidor Proxy de Redirección de Puertos (Port Forwarder)"
+    )
+    parser.add_argument(
+        "--local-host",
+        action="store",
+        dest="local_host",
+        default=LOCAL_SERVER_HOST,
+        help="Dirección IP/Host local",
+    )
+    parser.add_argument(
+        "--local-port",
+        action="store",
+        dest="local_port",
+        type=int,
+        required=True,
+        help="Puerto local a escuchar",
+    )
+    parser.add_argument(
+        "--remote-host",
+        action="store",
+        dest="remote_host",
+        default=REMOTE_SERVER_HOST,
+        help="Dirección IP/Host remoto de destino",
+    )
+    parser.add_argument(
+        "--remote-port",
+        action="store",
+        dest="remote_port",
+        type=int,
+        default=80,
+        help="Puerto remoto de destino",
+    )
+
+    args = parser.parse_args()
+
+    # Creación del servidor TCP asíncrono
+    server = await asyncio.start_server(
+        lambda r, w: handle_client(
+            r, w, args.remote_host, args.remote_port
+        ),
+        args.local_host,
+        args.local_port,
+    )
+
+    addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
+    logging.info(
+        "Servidor iniciado. Redireccionando %s => %s:%s",
+        addrs,
+        args.remote_host,
+        args.remote_port,
+    )
+
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Servidor detenido manualmente.")
